@@ -649,6 +649,137 @@ class LateReviewRegressionTest(unittest.TestCase):
                 self.assertFalse(negative_match.NegativeIndex([row]).hits(query, {'Other'}))
 
 
+class BulkNegativeCheckTest(unittest.TestCase):
+    def check_files(self, negatives, queries, *extra, query_name="q.csv"):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "neg.csv").write_text(negatives)
+            (root / query_name).write_text(queries)
+            return subprocess.run(
+                [sys.executable, str(SCRIPTS / "negative_match.py"), "--negatives", str(root / "neg.csv"),
+                 "--queries", str(root / query_name), *extra], capture_output=True, text=True)
+
+    def test_campaign_routing_does_not_block_brand_destination(self):
+        result = self.check_files(
+            "text,match_type,campaign\nnorthwind,PHRASE,Nonbrand\n",
+            "query,campaign,ad_group\nnorthwind pricing,Brand,Pricing\n")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("0 conflicts", result.stdout)
+
+    def test_ad_group_checks_preserve_actual_and_sibling_destinations(self):
+        result = self.check_files(
+            "text,match_type,campaign,ad_group,level\nnorthwind pricing,EXACT,NB,Other,ad group\n",
+            "query,campaign,ad_group\nnorthwind pricing,NB,Pricing\nnorthwind pricing,NB,Other\n")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("1 conflicts", result.stdout)
+        self.assertIn("NB / Other", result.stdout)
+        self.assertNotIn("NB / Pricing", result.stdout)
+
+    def test_account_campaign_and_attached_list_inherit_into_destination(self):
+        result = self.check_files(
+            "text,match_type,campaign,ad_group,level,source\n"
+            "jobs,BROAD,ACCOUNT,,account,account negative\n"
+            "free,PHRASE,NB,,campaign,campaign negative\n"
+            "login,PHRASE,NB,,shared list,General\n",
+            "query,campaign,ad_group\nscheduling jobs,Brand,Core\nfree tools,NB,Core\n"
+            "northwind login,NB,Core\nnorthwind login,Other,Core\n")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("3 conflicts", result.stdout)
+        self.assertNotIn("Other / Core", result.stdout)
+
+    def test_incomplete_negative_rows_do_not_pass(self):
+        cases = [
+            "negative,match_type,campaign\nnorthwind,EXACT,NB\n",
+            "text,match_type,campaign\n,EXACT,NB\n",
+            "text,match_type,campaign\nnorthwind,,NB\n",
+            "text,match_type,campaign\nnorthwind,BOGUS,NB\n",
+            "text,match_type,campaign\nnorthwind,EXACT,\n",
+            "text,match_type,campaign,level\nnorthwind,EXACT,NB,ad group\n",
+            "text,match_type,campaign,ad_group,level\nnorthwind,EXACT,ACCOUNT,Core,account\n",
+            "text,match_type,campaign,scope\nnorthwind,EXACT,NB,Other\n",
+        ]
+        for negatives in cases:
+            with self.subTest(negatives=negatives):
+                result = self.check_files(negatives, "query,campaign,ad_group\nnorthwind,NB,Core\n")
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertNotIn("0 conflicts", result.stdout)
+
+    def test_missing_query_scope_and_empty_queries_do_not_pass(self):
+        negatives = "text,match_type,campaign\nnorthwind,EXACT,NB\n"
+        for queries in ("query\nnorthwind\n", "query,campaign\nnorthwind,\n", "query,campaign\n"):
+            with self.subTest(queries=queries):
+                result = self.check_files(negatives, queries)
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        result = self.check_files(negatives, "northwind\n", query_name="q.txt")
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+
+    def test_plain_text_requires_ad_group_when_current_inventory_needs_it(self):
+        negatives = "text,match_type,campaign,ad_group,level\nnorthwind,EXACT,NB,Other,ad group\n"
+        result = self.check_files(negatives, "northwind\n", "--scope", "NB", query_name="q.txt")
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        for group, expected in (("Core", 0), ("Other", 1)):
+            result = self.check_files(negatives, "northwind\n", "--scope", "NB", "--ad-group", group,
+                                      query_name="q.txt")
+            self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+
+    def test_header_only_inventory_is_a_checked_empty_set(self):
+        result = self.check_files("text,match_type,campaign\n", "query,campaign,ad_group\nnorthwind,NB,Core\n")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("0 negatives and 1 queries", result.stdout)
+
+    def test_bulk_check_tokenization_scales_with_inputs_not_cross_product(self):
+        from unittest.mock import patch
+        negatives = [{"text": f"unrelated{i}", "match_type": "EXACT", "campaign": "NB"} for i in range(1000)]
+        queries = [{"query": f"buyer query {i}", "campaign": "NB", "ad_group": "Core"} for i in range(1000)]
+        with patch.object(negative_match, "_tokens", wraps=negative_match._tokens) as tokenize:
+            found = negative_match.scoped_conflicts(negatives, queries)
+            self.assertEqual(found, [])
+            self.assertLessEqual(tokenize.call_count, 4000)  # bounded work, not 1,000,000 pairwise checks
+
+    def test_scoped_index_agrees_with_exhaustive_destination_checks(self):
+        negatives = []
+        for campaign in ('ACCOUNT', 'Brand', 'NB'):
+            for group in (('',) if campaign == 'ACCOUNT' else ('', 'Core', 'Other')):
+                for kind in ('EXACT', 'PHRASE', 'BROAD'):
+                    for text in ('northwind pricing', 'pricing northwind', 'dark -chocolate', 'jobs'):
+                        negatives.append({'text': text, 'match_type': kind, 'campaign': campaign,
+                                          'ad_group': group})
+        queries = [{'query': text, 'campaign': campaign, 'ad_group': group}
+                   for campaign in ('Brand', 'NB', 'New') for group in ('Core', 'Other')
+                   for text in ('northwind pricing', 'northwind pricing help', 'pricing northwind',
+                                'dark cake', 'scheduler jobs', 'unrelated')]
+        actual = negative_match.scoped_conflicts(negatives, queries)
+        identity = lambda r, q: (r['text'], r['match_type'].lower(), r['campaign'], r.get('ad_group', ''),
+                                 q['query'], q['campaign'], q['ad_group'])
+        expected = [identity(n, q) for q in queries for n in negatives
+                    if n['campaign'] in ('ACCOUNT', q['campaign'])
+                    and (not n['ad_group'] or n['ad_group'] == q['ad_group'])
+                    and negative_match.blocks(n['text'], n['match_type'], q['query'])]
+        observed = [(r['negative'], r['match_type'], r['scope'], r['ad_group'], r['query'],
+                     r['query_campaign'], r['query_ad_group']) for r in actual]
+        self.assertCountEqual(observed, expected)
+
+    def test_malformed_csv_and_ambiguous_query_modes_are_rejected(self):
+        query = "query,campaign,ad_group\nnorthwind,NB,Core\n"
+        for negatives in (
+                "text,text,match_type,campaign\nnorthwind,other,EXACT,NB\n",
+                "text,match_type,campaign\nnorthwind,EXACT,NB,extra\n",
+                "text,match_type,campaign\nnorthwind,EXACT\n",
+                "text,match_type,campaign,level\nnorthwind,EXACT,NB,unknown\n"):
+            with self.subTest(negatives=negatives):
+                result = self.check_files(negatives, query)
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        result = self.check_files("text,match_type,campaign\nnorthwind,EXACT,NB\n", query, "--scope", "NB")
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+
+    def test_editor_style_headers_and_bom_keep_matching_values(self):
+        result = self.check_files(
+            '\ufeffKeyword,Match type,Campaign,Ad group,Level\nnorthwind,Exact match,NB,Core,ad group\n',
+            '\ufeffQuery,Campaign,Ad group\nnorthwind,NB,Core\n')
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("1 conflicts", result.stdout)
+
+
 class CommandLineTest(unittest.TestCase):
     def run_script(self, name, *args):
         return subprocess.run([sys.executable, str(SCRIPTS / name), *args], capture_output=True, text=True)
@@ -694,6 +825,41 @@ class CommandLineTest(unittest.TestCase):
                                {"text": "clinic scheduling", "match_type": "EXACT", "campaign": "NB - Core", "verdict": "Keep, unsure"}])
         rows = export_negative_verdicts.export_rows(review)
         self.assertEqual([r["Keyword"] for r in rows], ["scheduling jobs"])
+
+
+class InputValidationTest(unittest.TestCase):
+    def run_script(self, name, *args):
+        return subprocess.run([sys.executable, str(SCRIPTS / name), *args], capture_output=True, text=True)
+
+    def test_validate_rsa_rejects_rows_wider_than_header(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "rsa.csv"
+            header = ["Campaign", "Ad group", "Headline 1", "Headline 2", "Headline 3",
+                      "Description 1", "Description 2"]
+            path.write_text(",".join(header) + "\n"
+                            "NB - Core,Pricing,Plans, For Clinics,Book A Demo,See Pricing,"
+                            "Clinic scheduling.,Book a demo today.\n")
+            result = self.run_script("validate_rsa.py", str(path))
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("row 2 does not match the header width", result.stderr)
+
+    def test_validate_rsa_rejects_header_only_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "rsa.csv"
+            path.write_text("Campaign,Ad group,Headline 1,Description 1\n")
+            result = self.run_script("validate_rsa.py", str(path))
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("no RSA rows found", result.stderr)
+
+    def test_negative_match_rejects_mixed_single_and_bulk_arguments(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            (tmp / "neg.csv").write_text("text,match_type,campaign\nnorthwind login,PHRASE,NB - Core\n")
+            (tmp / "q.csv").write_text("query,campaign,ad_group\nnorthwind pricing,NB - Core,Pricing\n")
+            result = self.run_script("negative_match.py", "blocked", "exact", "blocked",
+                                     "--negatives", str(tmp / "neg.csv"), "--queries", str(tmp / "q.csv"))
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("not both", result.stderr)
 
 
 if __name__ == "__main__":

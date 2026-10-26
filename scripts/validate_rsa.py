@@ -58,12 +58,21 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description='Validate RSA rows in an Editor-layout CSV.')
     ap.add_argument('csv_file')
     a = ap.parse_args(argv)
-    with open(a.csv_file, newline='', encoding='utf-8-sig') as fh:
-        rows = list(csv.DictReader(fh))
+    try:
+        with open(a.csv_file, newline='', encoding='utf-8-sig') as fh:
+            reader = csv.DictReader(fh)
+            fields = reader.fieldnames or []
+            rows = list(reader)
+    except (OSError, UnicodeError, csv.Error) as exc:
+        ap.error(str(exc))
+    if not any(f.startswith('Headline 1') for f in fields):
+        ap.error('expected Editor columns: Headline 1-15, Description 1-4, Path 1, Path 2')
     if not rows:
         ap.error('no RSA rows found')
-    if not any(k.startswith('Headline 1') for k in rows[0]):
-        ap.error('expected Editor columns: Headline 1-15, Description 1-4, Path 1, Path 2')
+    # An unquoted comma shifts every later asset; never validate a shifted row.
+    for i, r in enumerate(rows, start=2):
+        if None in r or any(v is None for v in r.values()):
+            ap.error(f'row {i} does not match the header width; quote fields that contain commas')
     bad = 0
     for i, r in enumerate(rows, start=2):
         H = [r.get(f'Headline {n}') for n in range(1, 16)]
