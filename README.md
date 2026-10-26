@@ -42,5 +42,8 @@ It works with partial data and says what it couldn't check.
 - `scripts/`: load UI or GAQL exports, resolve every current negative to its scope, surface GAP candidates, join conversion actions without double counting, check negative conflicts, validate RSA limits, and export approved negatives. The workbook and the keyword and RSA files are built by Claude from the spec; the scripts handle the parts where counting or matching errors are easy to make
 - `tests/`: worked example and edge cases (blocked and paused keywords, immature and stage-valued conversions, routing), plus unit tests for the scripts (`python3 -m unittest discover -s tests/scripts`)
 
+## Credits
+Rachelle Swain at TNT Growth built the original gap-analysis workflow, including the workbook design and the first candidate, export-loading and RSA scripts. This public edition aligns it with our Google Ads method and adds the negative-scope checks, conversion-action joins and tests.
+
 ---
 From [TNT Growth](https://tntgrowth.com/skills?utm_source=github&utm_campaign=treboutat). Use it, fork it, adapt it to your account.
