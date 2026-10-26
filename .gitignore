@@ -1,0 +1,19 @@
+# macOS
+.DS_Store
+**/.DS_Store
+
+# Editor / OS noise
+*.swp
+Thumbs.db
+
+# Local credential files (never commit — skills reference these by name only)
+google-ads.yaml
+.env
+*.env
+
+# Python
+__pycache__/
+*.pyc
+
+# Account data (never commit real exports)
+*.xlsx
