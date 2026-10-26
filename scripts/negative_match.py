@@ -23,6 +23,8 @@ text in different destinations. Plain text is one query per line and requires
 --scope; add --ad-group if that campaign has ad-group negatives. Missing scope,
 columns or values stop the check, rather than becoming an empty or global check.
 Only inherited negatives and the destination's own ad-group negatives apply.
+Account negatives are rows with level 'account' and campaign ACCOUNT; a real
+campaign named ACCOUNT needs an explicit level of 'campaign'.
 An indexed lookup prints each conflict and exits 1; clean checks exit 0, input
 errors exit 2. A header-only negative inventory is allowed; no queries is an error.
 
@@ -127,8 +129,16 @@ def conflicts(negatives, queries, scope=None):
     return out
 
 
+# Account rows are keyed by level. A real campaign may be named 'ACCOUNT'.
+ACCOUNT_SCOPE = '\x00account'
+
+
 def scoped_conflicts(negatives, queries):
     """Check normalized negatives against query/destination records, using the index."""
+    def scoped(row):
+        level = row.get('level') or ('account' if row['campaign'] == 'ACCOUNT' else '')
+        return {**row, 'scope': ACCOUNT_SCOPE if level == 'account' else row['campaign']}
+    negatives = [scoped(r) for r in negatives]
     local_campaigns = {r['campaign'] for r in negatives if r.get('ad_group')}
     index = NegativeIndex(negatives)
     out = []
@@ -137,7 +147,7 @@ def scoped_conflicts(negatives, queries):
         if not group and campaign in local_campaigns:
             raise ValueError(f'Query {query["query"]!r} in {campaign!r} needs ad_group: '
                              'the current inventory includes ad-group negatives')
-        for row in index.hits(query['query'], {campaign, 'ACCOUNT'}):
+        for row in index.hits(query['query'], {campaign, ACCOUNT_SCOPE}):
             if row.get('ad_group') and row['ad_group'] != group:
                 continue
             out.append({'negative': row['text'], 'match_type': match_type(row['match_type']),
@@ -184,7 +194,7 @@ def read_negative_rows(path):
         level = level or ('account' if campaign == 'ACCOUNT' else 'ad group' if group else 'campaign')
         if level not in ('account', 'campaign', 'shared list', 'ad group'):
             raise ValueError(f'{path}: row {number} has unknown negative level {level!r}')
-        if ((level == 'account') != (campaign == 'ACCOUNT')
+        if ((level == 'account' and campaign != 'ACCOUNT')
                 or (level == 'ad group') != bool(group)):
             raise ValueError(f'{path}: row {number} has inconsistent campaign, ad_group or level')
         out.append({'text': text, 'match_type': match_type(row['match_type']),
@@ -211,7 +221,7 @@ def read_query_rows(path, scope=None, ad_group=None):
                        for line in fh if line.strip()]
     if not queries:
         raise ValueError(f'{path}: no queries found; no protected demand was checked')
-    if any(not q['query'] or not q['campaign'] or q['campaign'] == 'ACCOUNT' for q in queries):
+    if any(not q['query'] or not q['campaign'] for q in queries):
         raise ValueError(f'{path}: every query needs text and its actual destination campaign')
     return queries
 

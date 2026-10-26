@@ -805,11 +805,12 @@ class CommandLineTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "rsa.csv"
             header = ["Campaign", "Ad group"] + [f"Headline {n}" for n in range(1, 16)] + \
-                     [f"Description {n}" for n in range(1, 5)] + ["Path 1", "Path 2"]
+                     [f"Description {n}" for n in range(1, 5)] + ["Path 1", "Path 2", "Ad type", "Final URL", "Status"]
+            upload = ["Responsive search ad", "https://example.com/pricing", "Paused"]
             good = ["NB - Core", "Pricing", "Northwind Pricing", "Plans For Clinics", "Book A Demo"] + [""] * 12 + \
-                   ["Scheduling software for clinics.", "See plans and book a demo today."] + ["", ""] + ["pricing", ""]
+                   ["Scheduling software for clinics.", "See plans and book a demo today."] + ["", ""] + ["pricing", ""] + upload
             bad = ["NB - Core", "Clinics", "A headline that is far too long to fit", "Two", "Three"] + [""] * 12 + \
-                  ["Only one description."] + ["", "", ""] + ["clinics", ""]
+                  ["Only one description."] + ["", "", ""] + ["clinics", ""] + upload
             with path.open("w", newline="") as fh:
                 writer = csv.writer(fh)
                 writer.writerows([header, good, bad])
@@ -860,6 +861,91 @@ class InputValidationTest(unittest.TestCase):
                                      "--negatives", str(tmp / "neg.csv"), "--queries", str(tmp / "q.csv"))
             self.assertEqual(result.returncode, 2)
             self.assertIn("not both", result.stderr)
+
+    def test_validate_rsa_rejects_duplicate_headers_that_hide_invalid_assets(self):
+        for duplicate in ('Headline 1', 'Headline 1 ', 'headline 1'):
+            with self.subTest(duplicate=duplicate), tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / 'rsa.csv'
+                with path.open('w', newline='') as fh:
+                    csv.writer(fh).writerows([
+                        ['Campaign', 'Ad group', 'Headline 1', duplicate, 'Headline 2', 'Headline 3',
+                         'Description 1', 'Description 2'],
+                        ['NB', 'Core', 'This headline is too long and must never pass the validator',
+                         'Plans', 'For Clinics', 'Book A Demo', 'Scheduling for clinics.', 'Book a demo today.']])
+                result = self.run_script('validate_rsa.py', str(path))
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertIn('unique', result.stderr)
+
+    def test_validate_rsa_rejects_malformed_csv_and_short_rows(self):
+        for row in ('NB,Core,Plans,For Clinics,Book A Demo,One description.\n',
+                    'NB,Core,"Plans"oops,For Clinics,Book A Demo,One description.,Another one.\n'):
+            with self.subTest(row=row), tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / 'rsa.csv'
+                path.write_text('Campaign,Ad group,Headline 1,Headline 2,Headline 3,Description 1,Description 2\n' + row)
+                result = self.run_script('validate_rsa.py', str(path))
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'rsa.csv'
+            with path.open('w', newline='') as fh:
+                csv.writer(fh).writerows([
+                    ['Campaign', 'Ad group', 'Ad type', 'Headline 1', 'Headline 2', 'Headline 3',
+                     'Description 1', 'Description 2', 'Final URL', 'Status'],
+                    ['NB', 'Core', 'Responsive search ad', 'Plans For Clinics', 'Book A Demo', 'See Pricing',
+                     'Clinic scheduling, without the paperwork.', 'Book a demo today.',
+                     'https://example.com/pricing', 'Paused']])
+            result = self.run_script('validate_rsa.py', str(path))
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+
+class UploadLayoutAndScopeTest(unittest.TestCase):
+    def run_script(self, name, *args):
+        return subprocess.run([sys.executable, str(SCRIPTS / name), *args], capture_output=True, text=True)
+
+    def write_rsa(self, tmp, header, row):
+        path = Path(tmp) / "rsa.csv"
+        with path.open("w", newline="") as fh:
+            csv.writer(fh).writerows([header, row])
+        return str(path)
+
+    def test_validate_rsa_requires_the_upload_layout(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self.write_rsa(tmp, ["Headline 10", "Headline 2", "Headline 3", "Description 1", "Description 2"],
+                                  ["Ten", "Two", "Three", "One.", "Two."])
+            result = self.run_script("validate_rsa.py", path)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("missing Campaign", result.stderr)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self.write_rsa(tmp, ["Campaign", "Ad group", "Ad type", "Headline 1", "Headline 16"],
+                                  ["NB", "Core", "Responsive search ad", "One", "Sixteen"])
+            result = self.run_script("validate_rsa.py", path)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("unrecognized asset columns: Headline 16", result.stderr)
+
+    def test_validate_rsa_flags_non_importable_rows(self):
+        header = ["Campaign", "Ad group", "Ad type", "Headline 1", "Headline 2", "Headline 3",
+                  "Description 1", "Description 2", "Final URL", "Status"]
+        row = ["NB", "Core", "Expanded text ad", "Plans For Clinics", "Book A Demo", "See Pricing",
+               "Clinic scheduling.", "Book a demo today.", "", "Enabled"]
+        with tempfile.TemporaryDirectory() as tmp:
+            result = self.run_script("validate_rsa.py", self.write_rsa(tmp, header, row))
+            self.assertEqual(result.returncode, 1)
+            for problem in ("blank Final URL", "ad type 'Expanded text ad'", "status 'Enabled'"):
+                self.assertIn(problem, result.stdout)
+
+    def test_campaign_named_account_is_a_campaign(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            (tmp / "neg.csv").write_text("text,match_type,campaign,ad_group,level,source\n"
+                                         "login,PHRASE,ACCOUNT,,campaign,campaign negative\n"
+                                         "jobs,BROAD,ACCOUNT,,account,account negative\n")
+            (tmp / "q.csv").write_text("query,campaign,ad_group\n"
+                                       "acme login,ACCOUNT,Core\nacme login,NB,Core\nacme jobs,NB,Core\n")
+            result = self.run_script("negative_match.py", "--negatives", str(tmp / "neg.csv"),
+                                     "--queries", str(tmp / "q.csv"))
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertIn("'acme login' at ACCOUNT / Core", result.stdout)
+            self.assertNotIn("'acme login' at NB / Core", result.stdout)
+            self.assertIn("'acme jobs' at NB / Core", result.stdout)
 
 
 if __name__ == "__main__":
